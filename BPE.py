@@ -1,207 +1,354 @@
-from typing import List, Tuple, Dict, Set
-import collections
 import os
-import re
+import heapq
+import regex
+import time
+import random
+import multiprocessing
 import json
+
+from functools import partial
 from tqdm import tqdm
+from pathlib import Path
+from typing import List, Tuple, Dict, DefaultDict, Any, Union
+
+import mmap
+import re
+from collections import defaultdict
 
 
-def bytes_to_unicode():
-    """把256个字节映射到Unicode字符上，确保每个字节都有对应的可打印字符"""
-    # 选出本身就可以打印的字节（188个）
-    bs = (
-        list(range(ord("!"), ord("~") + 1))
-        + list(range(ord("¡"), ord("¬") + 1))
-        + list(range(ord("®"), ord("ÿ") + 1))
+# GPT-2预分词模式
+GPT2_SPLIT_PATTERN = (
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
+
+
+def load_and_sample_data(
+    file_path: str, sample_size: int = 22000, special_token: str = "<|endoftext|>"
+) -> str:
+
+    try:
+        # 以读写模式打开文件，忽略编码错误
+        with open(file_path, "r+", encoding="utf-8", errors="ignore") as file:
+            # 使用 mmap 进行内存映射，提高读取效率
+            with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as mapped_file:
+                documents = []
+                start_idx = 0
+                special_token_bytes = special_token.encode("utf-8")
+                # 注意：这里应该使用字节长度，因为 mmap 操作的是字节
+                token_byte_len = len(special_token_bytes)
+
+                while start_idx < len(mapped_file):
+                    # 查找下一个分隔符的位置
+                    end_idx = mapped_file.find(special_token_bytes, start_idx)
+
+                    if end_idx == -1:
+                        # 处理最后一个文档
+                        content = (
+                            mapped_file[start_idx:]
+                            .decode("utf-8", errors="replace")
+                            .strip()
+                        )
+                        if content:
+                            documents.append(content)
+                        break
+
+                    # 解码当前文档内容
+                    content = (
+                        mapped_file[start_idx:end_idx]
+                        .decode("utf-8", errors="replace")
+                        .strip()
+                    )
+                    if content:
+                        documents.append(content)
+
+                    # 更新起始位置
+                    start_idx = end_idx + token_byte_len
+
+                # 如果文档数量超过采样大小，则进行随机采样
+                if len(documents) > sample_size:
+                    documents = random.sample(documents, sample_size)
+
+                return special_token.join(documents)
+
+    except Exception as e:
+        raise IOError(f"load datasets error: {e}")
+
+
+def bytes_to_unicode() -> Dict[int, str]:
+    # 构建字节到 Unicode 字符的映射，用于处理所有可能的字节值。
+    # 初始包含可打印字符的字节值
+    printable_bytes = (
+        list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
     )
-    # 复制一份数组
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:  # 如果这个字节不可被打印
-            bs.append(b)
-            cs.append(2**8 + n)  # 映射到256+n的位置的Unicode字符
-            n += 1
-    cs = [chr(n) for n in cs]  # 将Unicode码位转位实际字符
-    return dict(zip(bs, cs))  # 返回字节-字符的映射表
+
+    byte_values = printable_bytes[:]
+    char_codepoints = printable_bytes[:]
+    offset = 0
+
+    # 处理剩余的不可打印字节，映射到 256 之后的 Unicode 码点
+    for byte_val in range(256):
+        if byte_val not in printable_bytes:
+            byte_values.append(byte_val)
+            char_codepoints.append(256 + offset)
+            offset += 1
+
+    return {b: chr(c) for b, c in zip(byte_values, char_codepoints)}
 
 
-def get_stats(word_freqs: Dict[Tuple[str, ...], int]) -> Dict[Tuple[str, str], int]:
-    """计算所有相邻符号对的频率（优化版：使用词频）"""
-    pairs = collections.defaultdict(int)
+def pre_tokenize_document(
+    doc: str, bytes_to_unicode_map: Dict[int, str]
+) -> List[List[str]]:
+    tokens = regex.findall(GPT2_SPLIT_PATTERN, doc, flags=regex.UNICODE)
+    sequences = []
+    for token in tokens:
+        token_unicode = "".join(bytes_to_unicode_map[b] for b in token.encode("utf-8"))
+        sequences.append(list(token_unicode))
 
-    for word, freq in word_freqs.items():
-        for i in range(len(word) - 1):
-            pair = (word[i], word[i + 1])
-            pairs[pair] += freq
-
-    return pairs
+    return sequences
 
 
-def merge_word(
-    word: Tuple[str, ...], pair: Tuple[str, str], new_token: str
-) -> Tuple[str, ...]:
-    """合并单个单词中的token对"""
-    result = []
-    i = 0
-    while i < len(word):
-        if i < len(word) - 1 and word[i] == pair[0] and word[i + 1] == pair[1]:
-            result.append(new_token)
-            i += 2
-        else:
-            result.append(word[i])
-            i += 1
-    return tuple(result)
+# 全局变量用于多进程
+global_worker_byte_map = None
+
+
+def init_worker(byte_map: Dict[int, str]):
+    global global_worker_byte_map
+    global_worker_byte_map = byte_map
+
+
+def pre_tokenize_worker(doc: str) -> List[List[str]]:
+    return pre_tokenize_document(doc, global_worker_byte_map)
+
+
+def parallel_pre_tokenize(
+    documents: List[str], num_processes: int, bytes_to_unicode_map: Dict[int, str]
+) -> list[list[str]]:
+    if num_processes <= 1:
+        all_sequences = []
+        for doc in documents:
+            sequences = pre_tokenize_document(doc, bytes_to_unicode_map)
+            all_sequences.extend(sequences)
+        return all_sequences
+
+    with multiprocessing.Pool(
+        num_processes, initializer=init_worker, initargs=(bytes_to_unicode_map,)
+    ) as pool:
+
+        results = list(
+            tqdm(
+                pool.imap(pre_tokenize_worker, documents, chunksize=50),
+                total=len(documents),
+                desc="预分词",
+                mininterval=1,
+            )
+        )
+    return [seq for doc_sequences in results for seq in doc_sequences]
+
+
+class BPEIndex:
+    def __init__(self, token_sequences: List[List[str]]):
+        self.token_sequences = token_sequences
+        self.pair_counts: DefaultDict[Tuple[str, str], int] = defaultdict(int)
+        self.pair_locations: DefaultDict[Tuple[str, str], List[Tuple[int, int]]] = (
+            defaultdict(list)
+        )
+
+        self.max_heap = []  # Max heap
+
+        for seq_id, seq in enumerate(
+            tqdm(self.token_sequences, desc="Building BPE Index", mininterval=1)
+        ):
+            for token_idx in range(len(seq) - 1):
+                pair = (seq[token_idx], seq[token_idx + 1])
+                self.pair_counts[pair] += 1
+                self.pair_locations[pair].append((seq_id, token_idx))
+
+        for pair, count in tqdm(
+            self.pair_counts.items(), desc="Building Heap", mininterval=1
+        ):
+            if count > 1:
+                entry = [-count, pair]
+                heapq.heappush(self.max_heap, entry)
+
+    def _update_pair_count(self, token_pair: Tuple[str, str], count_delta: int):
+        if count_delta == 0:
+            return
+        if token_pair not in self.pair_counts:
+            self.pair_counts[token_pair] = 0
+        new_count = self.pair_counts[token_pair] + count_delta
+        self.pair_counts[token_pair] = new_count
+
+        if new_count < 0:
+            new_count = 0
+            self.pair_counts[token_pair] = 0
+
+        # 懒更新：直接推入新计数，旧的无效条目会在 get_most_frequent 中被过滤
+        if new_count > 1:
+            entry = [-new_count, token_pair]
+            heapq.heappush(self.max_heap, entry)
+
+    def _add_position(self, token_pair: Tuple[str, str], seq_id: int, token_idx: int):
+        self.pair_locations[token_pair].append((seq_id, token_idx))
+
+    def get_most_frequent(self) -> Tuple[str, str]:
+        while self.max_heap:
+            neg_count, pair = self.max_heap[0]
+            current_count = self.pair_counts.get(pair, 0)
+
+            # 检查堆顶元素是否有效（计数是否匹配）
+            if -neg_count == current_count:
+                if current_count > 1:
+                    return pair
+                else:
+                    # 计数 <= 1，不再需要合并
+                    heapq.heappop(self.max_heap)
+            else:
+                # 过期条目（计数已改变），丢弃
+                heapq.heappop(self.max_heap)
+        return None
+
+    def merge(self, target_pair: Tuple[str, str], new_token: str) -> int:
+        if (
+            target_pair not in self.pair_locations
+            or not self.pair_locations[target_pair]
+        ):
+            return 0
+        indices_by_seq_id = defaultdict(list)
+        for seq_id, token_idx in self.pair_locations[target_pair]:
+            indices_by_seq_id[seq_id].append(token_idx)
+
+        merge_count = 0
+        for seq_id, token_indices in indices_by_seq_id.items():
+            seq = self.token_sequences[seq_id]
+
+            token_indices.sort(reverse=True)  # 倒序
+            last_merged_idx = -2
+
+            for token_idx in token_indices:
+                # 检查索引是否越界（因为序列变短了）
+                if token_idx >= len(seq) - 1 or token_idx == last_merged_idx - 1:
+                    continue
+                if (
+                    seq[token_idx] != target_pair[0]
+                    or seq[token_idx + 1] != target_pair[1]
+                ):
+                    continue
+                seq[token_idx] = new_token
+                del seq[token_idx + 1]
+                merge_count += 1
+                last_merged_idx = token_idx
+
+                if token_idx > 0:
+                    left_pair = (seq[token_idx - 1], target_pair[0])
+                    self._update_pair_count(left_pair, -1)
+                    new_left_pair = (seq[token_idx - 1], new_token)
+                    self._update_pair_count(new_left_pair, 1)
+                    self._add_position(new_left_pair, seq_id, token_idx - 1)
+
+                if token_idx < len(seq) - 1:
+                    right_pair = (target_pair[1], seq[token_idx + 1])
+                    self._update_pair_count(right_pair, -1)
+
+                    new_right_pair = (new_token, seq[token_idx + 1])
+                    self._update_pair_count(new_right_pair, 1)
+                    self._add_position(new_right_pair, seq_id, token_idx)
+
+        if target_pair in self.pair_counts:
+            del self.pair_counts[target_pair]
+        if target_pair in self.pair_locations:
+            del self.pair_locations[target_pair]
+
+        return merge_count
 
 
 def train_bpe(
-    input_path: str | os.PathLike,
+    input_path: Union[str, os.PathLike],
     vocab_size: int,
-    special_tokens: list[str],
-):
-    """训练BPE tokenizer，返回词汇表和合并规则"""
-    # 建立字节<->Unicode字符的映射
-    byte_to_unicode = bytes_to_unicode()
-    unicode_to_bytes = {v: bytes([k]) for k, v in byte_to_unicode.items()}
+    special_tokens: List[str] = ["<|endoftext|>"],
+    num_processes: int = 8,
+    sample_size: int = 22000,
+) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    base_vocab_size = 256 + len(special_tokens)
+    if vocab_size < base_vocab_size:
+        raise ValueError(f"vocab_size must > {base_vocab_size}")
 
-    if not isinstance(vocab_size, int) or vocab_size <= 0:
-        raise ValueError("vocab_size must > 0")
+    # 1.字节 -> Unicode 映射
+    bytes_to_unicode_map = bytes_to_unicode()
 
-    # 初始化词汇表：256个基础字节
-    vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-    next_id: int = 256
-    existing_bytes: Set[bytes] = set(vocab.values())
+    unicode_to_bytes_map = {v: bytes([k]) for k, v in bytes_to_unicode_map.items()}
 
-    # 添加特殊token到词汇表
-    for token in special_tokens:
-        if len(vocab) >= vocab_size:
+    # 2.初始化词汇表
+    vocab = {i: bytes([i]) for i in range(256)}
+
+    next_token_id = 256
+    existing_bytes = set(vocab.values())
+
+    # 3.添加特殊token
+    for special_token in special_tokens:
+        special_tokens_bytes = special_token.encode("utf-8")
+        if special_tokens_bytes not in existing_bytes and len(vocab) < vocab_size:
+            vocab[next_token_id] = special_tokens_bytes
+            existing_bytes.add(special_tokens_bytes)
+            next_token_id += 1
+
+    # 4.加载采样数据
+    text = load_and_sample_data(
+        file_path=input_path, sample_size=sample_size, special_token=special_tokens[0]
+    )
+    # 5.分割文档
+    escaped_tokens = [re.escape(special_token) for special_token in special_tokens]
+    split_pattern = "|".join(escaped_tokens)
+    documents = [part for part in re.split(split_pattern, text) if part]
+
+    # 6.并行预分词
+    sequences = parallel_pre_tokenize(documents, num_processes, bytes_to_unicode_map)
+
+    # 7.构建初始化索引
+    bpe_index = BPEIndex(sequences)
+
+    merges = []
+    vocab_progress = len(vocab)
+
+    total_merges = vocab_size - vocab_progress
+
+    progress_bar = tqdm(
+        total=total_merges, desc="Training BPE", unit="merge", mininterval=0.5
+    )
+
+    while vocab_progress < vocab_size:
+        best_pair = bpe_index.get_most_frequent()
+        if best_pair is None:
             break
-        token_bytes = token.encode("utf-8")
-        if token_bytes not in existing_bytes:
-            vocab[next_id] = token_bytes
-            existing_bytes.add(token_bytes)
-            next_id += 1
+        new_token_str = best_pair[0] + best_pair[1]
 
-    # 读取训练文本
-    print(f"📖 读取训练文件: {input_path}")
-    try:
-        with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-    except FileNotFoundError:
-        text = ""
-
-    print(f"✓ 文件大小: {len(text):,} 字符")
-
-    # 按单词分割文本（保留空格）
-    print("🔍 分词处理中...")
-    words: List[str] = re.findall(r"\s*\S+", text)
-    print(f"✓ 共找到 {len(words):,} 个词")
-    # words = words[:10]  # 取消限制，使用全部数据
-
-    # 统计词频并转换为Unicode字符序列（关键优化：使用词频字典）
-    print("🔄 转换为字节序列并统计词频...")
-    word_freqs: Dict[Tuple[str, ...], int] = {}
-
-    for word in tqdm(words, desc="处理单词", unit="词", ncols=80):
-        word_bytes: bytes = word.encode("utf-8")
-        if not word_bytes:
+        # 确保我们能找到对应的字节表示
+        # 检查合并对是否在映射中（理论上一定在）
+        if (
+            best_pair[0] not in unicode_to_bytes_map
+            or best_pair[1] not in unicode_to_bytes_map
+        ):
             continue
-        # 转换为tuple（可哈希）以便作为字典key
-        word_tokens = tuple([byte_to_unicode[b] for b in word_bytes])
-        word_freqs[word_tokens] = word_freqs.get(word_tokens, 0) + 1
 
-    print(f"✓ 去重后唯一词数: {len(word_freqs):,}")
+        p1_bytes = unicode_to_bytes_map[best_pair[0]]
+        p2_bytes = unicode_to_bytes_map[best_pair[1]]
+        new_token_bytes = p1_bytes + p2_bytes
 
-    merges: List[Tuple[bytes, bytes]] = []
+        merge_count = bpe_index.merge(best_pair, new_token_str)
 
-    # 计算需要的merge次数
-    num_merges = vocab_size - len(vocab)
-    print(f"\n🚀 开始BPE训练")
-    print(f"   初始词汇表: {len(vocab)}")
-    print(f"   目标词汇表: {vocab_size}")
-    print(f"   需要合并: {num_merges} 次\n")
+        if merge_count == 0:
+            continue
 
-    # 迭代合并最频繁的token对
-    pbar = tqdm(total=num_merges, desc="训练进度", unit="merge", ncols=100)
+        if new_token_bytes not in existing_bytes:
+            vocab[next_token_id] = new_token_bytes
+            existing_bytes.add(new_token_bytes)
+            merges.append((p1_bytes, p2_bytes))
+            next_token_id += 1
+            vocab_progress += 1
+            progress_bar.update(1)
+            progress_bar.set_postfix({"vocab_size": vocab_progress})
 
-    while len(vocab) < vocab_size:
-        if not word_freqs:
-            break
+        # 更新映射，以便后续合并可以使用
+        unicode_to_bytes_map[new_token_str] = new_token_bytes
 
-        # 统计所有相邻token对的频率（只处理唯一词）
-        pair_counts = get_stats(word_freqs)
-        if not pair_counts:
-            break
-
-        # 找出频率最高的token对
-        best_pair: Tuple[str, str] = max(pair_counts, key=pair_counts.get)
-        freq = pair_counts[best_pair]
-
-        # 创建新token（拼接两个Unicode字符）
-        new_token: str = best_pair[0] + best_pair[1]
-
-        # 转换为字节表示
-        b1 = unicode_to_bytes[best_pair[0]]
-        b2 = unicode_to_bytes[best_pair[1]]
-        new_bytes: bytes = b1 + b2
-
-        # 更新映射和词汇表
-        unicode_to_bytes[new_token] = new_bytes
-        vocab[next_id] = new_bytes
-        merges.append((b1, b2))
-
-        # 在词频字典中应用这次合并（只处理包含该pair的词）
-        new_word_freqs = {}
-        for word, count in word_freqs.items():
-            # 只对包含该pair的词进行合并
-            if best_pair[0] in word and best_pair[1] in word:
-                new_word = merge_word(word, best_pair, new_token)
-                new_word_freqs[new_word] = count
-            else:
-                new_word_freqs[word] = count
-        word_freqs = new_word_freqs
-
-        # 更新进度条，显示当前合并的token信息
-        try:
-            token_display = new_bytes.decode("utf-8", errors="replace")[:20]
-        except:
-            token_display = str(new_bytes)[:20]
-        pbar.set_postfix({"token": token_display, "freq": f"{freq:,}"})
-        pbar.update(1)
-
-        next_id += 1
-
-    pbar.close()
-
-    # 保存词汇表到JSON
-    print("\n💾 保存词汇表到 vocab.json...")
-    with open("vocab.json", "w", encoding="utf-8") as f:
-        vocab_dict = {
-            token_id: token_bytes.decode("utf-8", errors="replace")
-            for token_id, token_bytes in vocab.items()
-        }
-        json.dump(vocab_dict, f, ensure_ascii=False, indent=4)
-
-    # 保存合并规则到文本文件
-    print("💾 保存合并规则到 merges.txt...")
-    with open("merges.txt", "w", encoding="utf-8") as f:
-        for b1, b2 in merges:
-            s1 = b1.decode("utf-8", errors="replace")
-            s2 = b2.decode("utf-8", errors="replace")
-            f.write(f"{s1} {s2}\n")
-
-    print(f"\n✨ 训练完成!")
-    print(f"   最终词汇表大小: {len(vocab)}")
-    print(f"   合并操作次数: {len(merges)}")
-
+    progress_bar.close()
     return vocab, merges
-
-
-if __name__ == "__main__":
-    special_tokens = ["<|endoftext|>"]
-    vocab, merges = train_bpe("./data/TinyStories-valid.txt", 20000, special_tokens)
-
-    # 打印前10个词汇表项
-    print("\n前10个词汇表项:")
-    for i, (token_id, token_bytes) in enumerate(list(vocab.items())[:10]):
-        print(f"  {token_id}: {token_bytes}")
