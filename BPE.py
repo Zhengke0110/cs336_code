@@ -30,7 +30,7 @@ def bytes_to_unicode():
 
 def get_stats(token_sequences: List[List[str]]) -> collections.Counter:
     """计算所有相邻符号对的频率"""
-    pairs = collections.Counter
+    pairs = collections.Counter()  # 需要加括号来实例化
 
     for token in token_sequences:
         for i in range(len(token) - 1):
