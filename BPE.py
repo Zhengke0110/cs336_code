@@ -6,6 +6,7 @@ import collections
 import os
 import re
 import json
+from tqdm import tqdm
 
 
 def bytes_to_unicode():
@@ -91,26 +92,41 @@ def train_bpe(
             next_id += 1
 
     # 读取训练文本
+    print(f"📖 读取训练文件: {input_path}")
     try:
         with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
     except FileNotFoundError:
         text = ""
+    
+    print(f"✓ 文件大小: {len(text):,} 字符")
 
     # 按单词分割文本（保留空格）
+    print("🔍 分词处理中...")
     words: List[str] = re.findall(r"\s*\S+", text)
+    print(f"✓ 共找到 {len(words):,} 个词")
 
     # 将每个单词转换为Unicode字符序列
+    print("🔄 转换为字节序列...")
     sequences: List[List[str]] = []
-    for word in words:
+    for word in tqdm(words, desc="处理单词", unit="词", ncols=80):
         word_bytes: bytes = word.encode("utf-8")
         if not word_bytes:
             continue
         sequences.append([byte_to_unicode[b] for b in word_bytes])
 
     merges: List[Tuple[bytes, bytes]] = []
+    
+    # 计算需要的merge次数
+    num_merges = vocab_size - len(vocab)
+    print(f"\n🚀 开始BPE训练")
+    print(f"   初始词汇表: {len(vocab)}")
+    print(f"   目标词汇表: {vocab_size}")
+    print(f"   需要合并: {num_merges} 次\n")
 
     # 迭代合并最频繁的token对
+    pbar = tqdm(total=num_merges, desc="训练进度", unit="merge", ncols=100)
+    
     while len(vocab) < vocab_size:
         if not sequences:
             break
@@ -122,6 +138,7 @@ def train_bpe(
 
         # 找出频率最高的token对
         best_pair: Tuple[str, str] = max(pair_counts, key=lambda x: pair_counts[x])
+        freq = pair_counts[best_pair]
 
         # 创建新token（拼接两个Unicode字符）
         new_token: str = best_pair[0] + best_pair[1]
@@ -139,9 +156,20 @@ def train_bpe(
         # 在所有序列中应用这次合并
         sequences = merge(sequences, best_pair, new_token)
 
+        # 更新进度条，显示当前合并的token信息
+        try:
+            token_display = new_bytes.decode('utf-8', errors='replace')[:20]
+        except:
+            token_display = str(new_bytes)[:20]
+        pbar.set_postfix({"token": token_display, "freq": freq})
+        pbar.update(1)
+        
         next_id += 1
+    
+    pbar.close()
 
     # 保存词汇表到JSON
+    print("\n💾 保存词汇表到 vocab.json...")
     with open("vocab.json", "w", encoding="utf-8") as f:
         vocab_dict = {
             token_id: token_bytes.decode("utf-8", errors="replace")
@@ -150,12 +178,17 @@ def train_bpe(
         json.dump(vocab_dict, f, ensure_ascii=False, indent=4)
 
     # 保存合并规则到文本文件
+    print("💾 保存合并规则到 merges.txt...")
     with open("merges.txt", "w", encoding="utf-8") as f:
         for b1, b2 in merges:
             s1 = b1.decode("utf-8", errors="replace")
             s2 = b2.decode("utf-8", errors="replace")
             f.write(f"{s1} {s2}\n")
 
+    print(f"\n✨ 训练完成!")
+    print(f"   最终词汇表大小: {len(vocab)}")
+    print(f"   合并操作次数: {len(merges)}")
+    
     return vocab, merges
 
 
