@@ -1,3 +1,6 @@
+import torch
+import torch.nn.functional as F
+from torch import nn
 from typing import List, Tuple, Dict, Set
 import collections
 import os
@@ -26,32 +29,38 @@ def bytes_to_unicode():
     return dict(zip(bs, cs))  # 返回字节-字符的映射表
 
 
-def get_stats(word_freqs: Dict[Tuple[str, ...], int]) -> Dict[Tuple[str, str], int]:
-    """计算所有相邻符号对的频率（优化版：使用词频）"""
-    pairs = collections.defaultdict(int)
+def get_stats(token_sequences: List[List[str]]) -> collections.Counter:
+    """计算所有相邻符号对的频率"""
+    pairs = collections.Counter()  # 需要加括号来实例化
 
-    for word, freq in word_freqs.items():
-        for i in range(len(word) - 1):
-            pair = (word[i], word[i + 1])
-            pairs[pair] += freq
-
+    for token in token_sequences:
+        for i in range(len(token) - 1):
+            pair = (token[i], token[i + 1])
+            pairs[pair] += 1
     return pairs
 
 
-def merge_word(
-    word: Tuple[str, ...], pair: Tuple[str, str], new_token: str
-) -> Tuple[str, ...]:
-    """合并单个单词中的token对"""
+def merge(
+    sequences: List[List[str]],
+    pair: Tuple[str, str],
+    new_token: str,
+) -> List[List[str]]:
+    """将所有序列中的指定token对合并为新token"""
     result = []
-    i = 0
-    while i < len(word):
-        if i < len(word) - 1 and word[i] == pair[0] and word[i + 1] == pair[1]:
-            result.append(new_token)
-            i += 2
-        else:
-            result.append(word[i])
-            i += 1
-    return tuple(result)
+    (t1, t2) = pair
+    for seq in sequences:
+        new_seq = []
+        i = 0
+        while i < len(seq):
+            # 如果当前位置和下一位置匹配pair，则合并
+            if i < len(seq) - 1 and seq[i] == t1 and seq[i + 1] == t2:
+                new_seq.append(new_token)
+                i += 2  # 跳过已合并的两个token
+            else:
+                new_seq.append(seq[i])
+                i += 1
+        result.append(new_seq)
+    return result
 
 
 def train_bpe(
@@ -96,21 +105,15 @@ def train_bpe(
     print("🔍 分词处理中...")
     words: List[str] = re.findall(r"\s*\S+", text)
     print(f"✓ 共找到 {len(words):,} 个词")
-    # words = words[:10]  # 取消限制，使用全部数据
 
-    # 统计词频并转换为Unicode字符序列（关键优化：使用词频字典）
-    print("🔄 转换为字节序列并统计词频...")
-    word_freqs: Dict[Tuple[str, ...], int] = {}
-
+    # 将每个单词转换为Unicode字符序列
+    print("🔄 转换为字节序列...")
+    sequences: List[List[str]] = []
     for word in tqdm(words, desc="处理单词", unit="词", ncols=80):
         word_bytes: bytes = word.encode("utf-8")
         if not word_bytes:
             continue
-        # 转换为tuple（可哈希）以便作为字典key
-        word_tokens = tuple([byte_to_unicode[b] for b in word_bytes])
-        word_freqs[word_tokens] = word_freqs.get(word_tokens, 0) + 1
-
-    print(f"✓ 去重后唯一词数: {len(word_freqs):,}")
+        sequences.append([byte_to_unicode[b] for b in word_bytes])
 
     merges: List[Tuple[bytes, bytes]] = []
 
@@ -125,16 +128,16 @@ def train_bpe(
     pbar = tqdm(total=num_merges, desc="训练进度", unit="merge", ncols=100)
 
     while len(vocab) < vocab_size:
-        if not word_freqs:
+        if not sequences:
             break
 
-        # 统计所有相邻token对的频率（只处理唯一词）
-        pair_counts = get_stats(word_freqs)
+        # 统计所有相邻token对的频率
+        pair_counts = get_stats(sequences)
         if not pair_counts:
             break
 
         # 找出频率最高的token对
-        best_pair: Tuple[str, str] = max(pair_counts, key=pair_counts.get)
+        best_pair: Tuple[str, str] = max(pair_counts, key=lambda x: pair_counts[x])
         freq = pair_counts[best_pair]
 
         # 创建新token（拼接两个Unicode字符）
@@ -150,16 +153,8 @@ def train_bpe(
         vocab[next_id] = new_bytes
         merges.append((b1, b2))
 
-        # 在词频字典中应用这次合并（只处理包含该pair的词）
-        new_word_freqs = {}
-        for word, count in word_freqs.items():
-            # 只对包含该pair的词进行合并
-            if best_pair[0] in word and best_pair[1] in word:
-                new_word = merge_word(word, best_pair, new_token)
-                new_word_freqs[new_word] = count
-            else:
-                new_word_freqs[word] = count
-        word_freqs = new_word_freqs
+        # 在所有序列中应用这次合并
+        sequences = merge(sequences, best_pair, new_token)
 
         # 更新进度条，显示当前合并的token信息
         try:
@@ -201,7 +196,4 @@ if __name__ == "__main__":
     special_tokens = ["<|endoftext|>"]
     vocab, merges = train_bpe("./data/TinyStories-valid.txt", 20000, special_tokens)
 
-    # 打印前10个词汇表项
-    print("\n前10个词汇表项:")
-    for i, (token_id, token_bytes) in enumerate(list(vocab.items())[:10]):
-        print(f"  {token_id}: {token_bytes}")
+    print(vocab[:10])

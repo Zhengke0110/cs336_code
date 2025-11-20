@@ -1,2 +1,5 @@
 *.npy
 *.pt
+
+vocab.json
+merges.txt
