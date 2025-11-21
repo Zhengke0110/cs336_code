@@ -78,10 +78,8 @@ class RMSNorm(nn.Module):
 
         variance = x.pow(2).mean(-1, keepdim=True)
 
-        # x = x * torch.rsqrt(variance + self.eps)
-        x *= torch.rsqrt(variance + self.eps)
-        # x = x * self.weight
-        x *= self.weight
+        x = x * torch.rsqrt(variance + self.eps)
+        x = x * self.weight
 
         return x.to(input_dtype)
 
@@ -269,22 +267,91 @@ class CausalMulHeadAttention(nn.Module):
             q = self.rope(q, positions)
             k = self.rope(k, positions)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         mask = self.causal_mask[:seq_len, :seq_len]
 
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / sqrt(self.head_dim)
         attn_scores = attn_scores.masked_fill(mask, float("-inf"))
         attn_weights = softmax(attn_scores, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)
-
         attn_output = (
-            attn_output.transpose(1, 2)
+            torch.matmul(attn_weights, v)
+            .transpose(1, 2)
             .contiguous()
             .view(batch_size, seq_len, self.d_model)
         )
 
         output = self.wo(attn_output)
         return output
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        w_o: torch.Tensor,
+        w_ln1: torch.Tensor,
+        w_ln2: torch.Tensor,
+        w_ffn_w1: torch.Tensor,
+        w_ffn_w2: torch.Tensor,
+        w_ffn_w3: torch.Tensor,
+        device: torch.device,
+    ):
+        super(TransformerBlock, self).__init__()
+        self.w_q, self.w_k, self.w_v, self.w_o = w_q, w_k, w_v, w_o
+        self.w_ln1, self.w_ln2 = w_ln1, w_ln2
+        self.w_ffn_w1, self.w_ffn_w2, self.w_ffn_w3 = w_ffn_w1, w_ffn_w2, w_ffn_w3
+        self.device = device
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_ff = d_ff
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+
+        self.rms_norm1 = RMSNorm(d_model=d_model, eps=1e-5, device=device)
+        self.rms_norm1.load_state_dict({"weight": w_ln1})
+        self.rms_norm2 = RMSNorm(d_model=d_model, eps=1e-5, device=device)
+        self.rms_norm2.load_state_dict({"weight": w_ln2})
+
+        self.swiglu = SwiGLU(d_model=d_model, d_ff=d_ff)
+        self.swiglu.load_state_dict(
+            {
+                "w1.weight": w_ffn_w1,
+                "w2.weight": w_ffn_w2,
+                "w3.weight": w_ffn_w3,
+            }
+        )
+        self.causal_multi_head_attn = CausalMulHeadAttention(
+            d_model=d_model,
+            num_heads=n_heads,
+            rope=RoPE(
+                theta=theta,
+                d_k=d_model // n_heads,
+                max_seq_len=max_seq_len,
+                device=device,
+            ),
+        )
+        self.causal_multi_head_attn.load_state_dict(
+            {
+                "wq.weight": w_q,
+                "wk.weight": w_k,
+                "wv.weight": w_v,
+                "wo.weight": w_o,
+            },
+            strict=False,
+        )
+
+    def forward(self, x: torch.Tensor):
+        h = x + self.causal_multi_head_attn(self.rms_norm1(x))
+
+        # x = x + FFN(Norm2(x))
+        out = h + self.swiglu(self.rms_norm2(h))
+        return out
