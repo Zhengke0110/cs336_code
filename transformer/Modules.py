@@ -9,8 +9,8 @@ class Linear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
+        device: torch.device = None,
+        dtype: torch.dtype = None,
     ):
         super().__init__()
         self.in_features = in_features
@@ -38,8 +38,8 @@ class Embedding(nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
+        device: torch.device = None,
+        dtype: torch.dtype = None,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -65,8 +65,8 @@ class RMSNorm(nn.Module):
         self,
         d_model: int,
         eps: float = 1e-5,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
+        device: torch.device = None,
+        dtype: torch.dtype = None,
     ):
         super().__init__()
         self.eps = eps
@@ -99,8 +99,8 @@ class SwiGLU(nn.Module):
         self,
         d_model: int,
         d_ff: int,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
+        device: torch.device = None,
+        dtype: torch.dtype = None,
     ):
         super().__init__()
         # W1: 门控机制的一部分，将输入维度 d_model 映射到隐藏层维度 d_ff
@@ -133,7 +133,7 @@ class RoPE(nn.Module):
         theta: float,
         d_k: int,
         max_seq_len: int,
-        device: torch.device | None = None,
+        device: torch.device = None,
     ):
         super().__init__()
         if d_k % 2 != 0:
@@ -196,3 +196,95 @@ class RoPE(nn.Module):
         out = torch.stack([out_even, out_odd], dim=-1).flatten(-2)
 
         return out
+
+
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    x_max = x.max(dim=dim, keepdim=True)[0]
+    x_exp = torch.exp(x - x_max)
+    return x_exp / x_exp.sum(dim=dim, keepdim=True)
+
+
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        mask: torch.Tensor = None,
+    ):
+        d_k = Q.shape[-1]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k**0.5)
+        if mask is not None:
+            scores = scores.masked_fill(mask, float("-inf"))
+
+        attn_weights = softmax(scores, dim=-1)
+        return torch.matmul(attn_weights, V)
+
+
+class CausalMulHeadAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, rope: nn.Module = None):
+        super().__init__()
+
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+            )
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+        self.wv = nn.Linear(d_model, d_model, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+        self.rope = rope
+
+        max_seq_len = 2048
+        causal_mask = torch.triu(
+            torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1
+        )
+
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        q: torch.Tensor = self.wq(x)
+        k: torch.Tensor = self.wk(x)
+        v: torch.Tensor = self.wv(x)
+
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        if self.rope is not None:
+            positions = (
+                torch.arange(seq_len, device=x.device)
+                .unsqueeze(0)
+                .expand(batch_size, seq_len)
+            )
+            q = self.rope(q, positions)
+            k = self.rope(k, positions)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        mask = self.causal_mask[:seq_len, :seq_len]
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / sqrt(self.head_dim)
+        attn_scores = attn_scores.masked_fill(mask, float("-inf"))
+        attn_weights = softmax(attn_scores, dim=-1)
+        attn_output = torch.matmul(attn_weights, v)
+
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.d_model)
+        )
+
+        output = self.wo(attn_output)
+        return output
