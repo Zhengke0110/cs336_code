@@ -218,6 +218,9 @@ class BPEIndex:
             indices_by_seq_id[seq_id].append(token_idx)
 
         merge_count = 0
+        # Batch count updates to reduce heap operations
+        count_changes = defaultdict(int)
+
         for seq_id, token_indices in indices_by_seq_id.items():
             seq = self.token_sequences[seq_id]
 
@@ -240,18 +243,25 @@ class BPEIndex:
 
                 if token_idx > 0:
                     left_pair = (seq[token_idx - 1], target_pair[0])
-                    self._update_pair_count(left_pair, -1)
+                    count_changes[left_pair] -= 1
+
                     new_left_pair = (seq[token_idx - 1], new_token)
-                    self._update_pair_count(new_left_pair, 1)
+                    count_changes[new_left_pair] += 1
+
                     self._add_position(new_left_pair, seq_id, token_idx - 1)
 
                 if token_idx < len(seq) - 1:
                     right_pair = (target_pair[1], seq[token_idx + 1])
-                    self._update_pair_count(right_pair, -1)
+                    count_changes[right_pair] -= 1
 
                     new_right_pair = (new_token, seq[token_idx + 1])
-                    self._update_pair_count(new_right_pair, 1)
+                    count_changes[new_right_pair] += 1
+
                     self._add_position(new_right_pair, seq_id, token_idx)
+
+        # Apply batched updates
+        for pair, delta in count_changes.items():
+            self._update_pair_count(pair, delta)
 
         if target_pair in self.pair_counts:
             del self.pair_counts[target_pair]
@@ -360,23 +370,17 @@ def save_vocab(
     os.makedirs(save_dir, exist_ok=True)
 
     # Save vocab
-    # Convert bytes to latin-1 strings for JSON serialization
-    vocab_str = {k: v.decode("latin-1") for k, v in vocab.items()}
+    # Convert bytes to utf-8 strings for JSON serialization
+    vocab_str = {k: v.decode("utf-8", errors="replace") for k, v in vocab.items()}
     with open(os.path.join(save_dir, "vocab.json"), "w", encoding="utf-8") as f:
         json.dump(vocab_str, f, indent=2, ensure_ascii=False)
 
     # Save merges
-    # Use bytes_to_unicode to map bytes to "safe" characters (avoiding spaces)
-    byte_encoder = bytes_to_unicode()
-
-    def bytes_to_safe_string(b_seq: bytes) -> str:
-        return "".join(byte_encoder[b] for b in b_seq)
-
+    # Match test.py format: decode bytes to utf-8 (real characters, not safe chars)
     with open(os.path.join(save_dir, "merges.txt"), "w", encoding="utf-8") as f:
-        # Write version or header if needed, but simple format is fine
         for p1, p2 in merges:
-            s1 = bytes_to_safe_string(p1)
-            s2 = bytes_to_safe_string(p2)
+            s1 = p1.decode("utf-8", errors="replace")
+            s2 = p2.decode("utf-8", errors="replace")
             f.write(f"{s1} {s2}\n")
 
 
@@ -393,25 +397,34 @@ def load_vocab(load_dir: str) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes
         vocab_str = json.load(f)
 
     # 将 key 转回 int，value 转回 bytes
-    vocab = {int(k): v.encode("latin-1") for k, v in vocab_str.items()}
-
-    # 加载 merges.txt
-    byte_encoder = bytes_to_unicode()
-    byte_decoder = {v: k for k, v in byte_encoder.items()}
-
-    def safe_string_to_bytes(s: str) -> bytes:
-        return bytes([byte_decoder[c] for c in s])
+    vocab = {int(k): v.encode("utf-8") for k, v in vocab_str.items()}
+    vocab_values = set(vocab.values())
 
     merges = []
     with open(merges_path, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
+            line = line.strip("\n")  # Only strip newline, preserve spaces
             if not line or line.startswith("#"):
                 continue
-            parts = line.split(" ")
-            if len(parts) == 2:
-                p1 = safe_string_to_bytes(parts[0])
-                p2 = safe_string_to_bytes(parts[1])
-                merges.append((p1, p2))
+
+            space_indices = [i for i, c in enumerate(line) if c == " "]
+            found_merge = False
+
+            for split_idx in space_indices:
+                part1 = line[:split_idx]
+                part2 = line[split_idx + 1 :]
+
+                p1_bytes = part1.encode("utf-8")
+                p2_bytes = part2.encode("utf-8")
+
+                if p1_bytes in vocab_values and p2_bytes in vocab_values:
+                    merges.append((p1_bytes, p2_bytes))
+                    found_merge = True
+                    break
+
+            if not found_merge:
+                parts = line.split(" ")
+                if len(parts) == 2:
+                    merges.append((parts[0].encode("utf-8"), parts[1].encode("utf-8")))
 
     return vocab, merges
