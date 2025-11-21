@@ -1,6 +1,6 @@
 import os
 import time
-from BPE import train_bpe
+from BPE import train_bpe,save_vocab
 
 def test_real_dataset():
     # 数据集路径
@@ -14,7 +14,7 @@ def test_real_dataset():
     print(f"Starting BPE training on {data_path}...")
     
     # 设置参数
-    vocab_size = 500  # 设置一个较小的词表大小以便快速测试，实际训练通常更大 (e.g., 32000, 50000)
+    vocab_size = 10000  # 设置一个较小的词表大小以便快速测试，实际训练通常更大 (e.g., 32000, 50000)
     special_tokens = ["<|endoftext|>"]
     
     start_time = time.time()
@@ -25,7 +25,7 @@ def test_real_dataset():
             vocab_size=vocab_size,
             special_tokens=special_tokens,
             num_processes=4, # 根据你的机器核心数调整
-            sample_size=1000 # 采样1000个文档进行训练
+            sample_size=30000 # 采样1000个文档进行训练
         )
         
         end_time = time.time()
@@ -34,6 +34,10 @@ def test_real_dataset():
         print(f"\nTraining completed in {duration:.2f} seconds.")
         print(f"Final vocab size: {len(vocab)}")
         print(f"Number of merges: {len(merges)}")
+        
+        save_dir = "./models/tinystories_vocab"
+        print(f"Saving vocab to {save_dir}...")
+        save_vocab(vocab, merges, save_dir)
         
         # 打印一些合并规则示例
         print("\nTop 10 merges:")

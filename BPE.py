@@ -352,3 +352,66 @@ def train_bpe(
 
     progress_bar.close()
     return vocab, merges
+
+
+def save_vocab(
+    vocab: Dict[int, bytes], merges: List[Tuple[bytes, bytes]], save_dir: str
+):
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save vocab
+    # Convert bytes to latin-1 strings for JSON serialization
+    vocab_str = {k: v.decode("latin-1") for k, v in vocab.items()}
+    with open(os.path.join(save_dir, "vocab.json"), "w", encoding="utf-8") as f:
+        json.dump(vocab_str, f, indent=2, ensure_ascii=False)
+
+    # Save merges
+    # Use bytes_to_unicode to map bytes to "safe" characters (avoiding spaces)
+    byte_encoder = bytes_to_unicode()
+
+    def bytes_to_safe_string(b_seq: bytes) -> str:
+        return "".join(byte_encoder[b] for b in b_seq)
+
+    with open(os.path.join(save_dir, "merges.txt"), "w", encoding="utf-8") as f:
+        # Write version or header if needed, but simple format is fine
+        for p1, p2 in merges:
+            s1 = bytes_to_safe_string(p1)
+            s2 = bytes_to_safe_string(p2)
+            f.write(f"{s1} {s2}\n")
+
+
+def load_vocab(load_dir: str) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    # 从指定目录加载词表和合并规则
+    vocab_path = os.path.join(load_dir, "vocab.json")
+    merges_path = os.path.join(load_dir, "merges.txt")
+
+    if not os.path.exists(vocab_path) or not os.path.exists(merges_path):
+        raise FileNotFoundError(f"vocab.json or merges.txt not found in {load_dir}")
+
+    # 加载 vocab.json
+    with open(vocab_path, "r", encoding="utf-8") as f:
+        vocab_str = json.load(f)
+
+    # 将 key 转回 int，value 转回 bytes
+    vocab = {int(k): v.encode("latin-1") for k, v in vocab_str.items()}
+
+    # 加载 merges.txt
+    byte_encoder = bytes_to_unicode()
+    byte_decoder = {v: k for k, v in byte_encoder.items()}
+
+    def safe_string_to_bytes(s: str) -> bytes:
+        return bytes([byte_decoder[c] for c in s])
+
+    merges = []
+    with open(merges_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(" ")
+            if len(parts) == 2:
+                p1 = safe_string_to_bytes(parts[0])
+                p2 = safe_string_to_bytes(parts[1])
+                merges.append((p1, p2))
+
+    return vocab, merges
