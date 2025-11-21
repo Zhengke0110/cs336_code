@@ -4,3 +4,5 @@
 vocab.json
 merges.txt
 __pycache__
+
+test*
