@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from math import sqrt, cos, pi
 from collections.abc import Callable, Iterable
 
+import numpy as np
+
 
 class Linear(nn.Module):
     def __init__(
@@ -567,3 +569,19 @@ class GradientClip:
             clip_coeff = self.max_l2_norm / (total_norm + self.eps)
             for grad in valid_gradients:
                 grad.detach().mul_(clip_coeff)
+
+
+def get_batch(
+    x: np.ndarray, batch_size: int, len_context: int, device: torch.device = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert len(x) > len_context + 1
+
+    max_start = len(x) - len_context - 1
+    starts = np.random.randint(0, max_start, size=batch_size)
+
+    inputs = np.stack([x[i : i + len_context] for i in starts])
+    targets = np.stack([x[i + 1 : i + len_context + 1] for i in starts])
+    return (
+        torch.tensor(inputs, dtype=torch.long, device=device),
+        torch.tensor(targets, dtype=torch.long, device=device),
+    )
