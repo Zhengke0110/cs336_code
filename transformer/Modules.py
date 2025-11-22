@@ -550,3 +550,20 @@ class CosineSchedule:
             progress = (current - self.warmup) / (self.cosine_cycle - self.warmup)
             cosine_decay = (1 + cos(pi * progress)) / 2
             return self.min_lr + (self.max_lr - self.min_lr) * cosine_decay
+
+
+class GradientClip:
+    def __init__(self, parameters, max_l2_norm, eps: float = 1e-6):
+        self.parameters = parameters
+        self.max_l2_norm = max_l2_norm
+        self.eps = eps
+
+    def __call__(self):
+        valid_gradients = [p.grad for p in self.parameters if p.grad is not None]
+        flattened_grads = torch.cat([grad.flatten() for grad in valid_gradients])
+        total_norm = torch.norm(flattened_grads, 2)
+
+        if total_norm > self.max_l2_norm:
+            clip_coeff = self.max_l2_norm / (total_norm + self.eps)
+            for grad in valid_gradients:
+                grad.detach().mul_(clip_coeff)
