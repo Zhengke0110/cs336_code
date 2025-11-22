@@ -2,7 +2,7 @@ from typing import Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
-from math import sqrt
+from math import sqrt, cos, pi
 from collections.abc import Callable, Iterable
 
 
@@ -534,3 +534,19 @@ class Adamw(torch.optim.Optimizer):
 
                 p.data.add_(p.data, alpha=-weight_decay * lr)
         return loss
+
+
+class CosineSchedule:
+    def __init__(self, max_lr: float, min_lr: float, warmup: int, cosine_cycle: int):
+        self.max_lr, self.min_lr = max_lr, min_lr
+        self.warmup, self.cosine_cycle = warmup, cosine_cycle
+
+    def __call__(self, current: int):
+        if current < self.warmup:
+            return self.max_lr * current / self.warmup
+        elif current > self.cosine_cycle:
+            return self.min_lr
+        else:
+            progress = (current - self.warmup) / (self.cosine_cycle - self.warmup)
+            cosine_decay = (1 + cos(pi * progress)) / 2
+            return self.min_lr + (self.max_lr - self.min_lr) * cosine_decay
