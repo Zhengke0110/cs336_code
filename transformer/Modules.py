@@ -147,7 +147,7 @@ class RoPE(nn.Module):
 
         # 计算频率: theta^(-2i/d)
         # i 取值范围 [0, 2, ..., d_k-2]
-        freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2).float() / d_k))
+        freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device).float() / d_k))
 
         # 生成位置索引 [0, 1, ..., max_seq_len-1]
         positions = torch.arange(max_seq_len, device=device)
@@ -311,16 +311,16 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         max_seq_len: int,
         theta: float,
-        w_q: torch.Tensor,
-        w_k: torch.Tensor,
-        w_v: torch.Tensor,
-        w_o: torch.Tensor,
-        w_ln1: torch.Tensor,
-        w_ln2: torch.Tensor,
-        w_ffn_w1: torch.Tensor,
-        w_ffn_w2: torch.Tensor,
-        w_ffn_w3: torch.Tensor,
         device: torch.device,
+        w_q: torch.Tensor = None,
+        w_k: torch.Tensor = None,
+        w_v: torch.Tensor = None,
+        w_o: torch.Tensor = None,
+        w_ln1: torch.Tensor = None,
+        w_ln2: torch.Tensor = None,
+        w_ffn_w1: torch.Tensor = None,
+        w_ffn_w2: torch.Tensor = None,
+        w_ffn_w3: torch.Tensor = None,
     ):
         super(TransformerBlock, self).__init__()
         self.w_q, self.w_k, self.w_v, self.w_o = w_q, w_k, w_v, w_o
@@ -335,18 +335,21 @@ class TransformerBlock(nn.Module):
         self.theta = theta
 
         self.rms_norm1 = RMSNorm(d_model=d_model, eps=1e-5, device=device)
-        self.rms_norm1.load_state_dict({"weight": w_ln1})
+        if w_ln1 is not None:
+            self.rms_norm1.load_state_dict({"weight": w_ln1})
         self.rms_norm2 = RMSNorm(d_model=d_model, eps=1e-5, device=device)
-        self.rms_norm2.load_state_dict({"weight": w_ln2})
+        if w_ln2 is not None:
+            self.rms_norm2.load_state_dict({"weight": w_ln2})
 
-        self.swiglu = SwiGLU(d_model=d_model, d_ff=d_ff)
-        self.swiglu.load_state_dict(
-            {
-                "w1.weight": w_ffn_w1,
-                "w2.weight": w_ffn_w2,
-                "w3.weight": w_ffn_w3,
-            }
-        )
+        self.swiglu = SwiGLU(d_model=d_model, d_ff=d_ff, device=device)
+        if w_ffn_w1 is not None and w_ffn_w2 is not None and w_ffn_w3 is not None:
+            self.swiglu.load_state_dict(
+                {
+                    "w1.weight": w_ffn_w1,
+                    "w2.weight": w_ffn_w2,
+                    "w3.weight": w_ffn_w3,
+                }
+            )
         self.causal_multi_head_attn = CausalMulHeadAttention(
             d_model=d_model,
             num_heads=n_heads,
@@ -357,15 +360,16 @@ class TransformerBlock(nn.Module):
                 device=device,
             ),
         )
-        self.causal_multi_head_attn.load_state_dict(
-            {
-                "wq.weight": w_q,
-                "wk.weight": w_k,
-                "wv.weight": w_v,
-                "wo.weight": w_o,
-            },
-            strict=False,
-        )
+        if w_q is not None and w_k is not None and w_v is not None and w_o is not None:
+            self.causal_multi_head_attn.load_state_dict(
+                {
+                    "wq.weight": w_q,
+                    "wk.weight": w_k,
+                    "wv.weight": w_v,
+                    "wo.weight": w_o,
+                },
+                strict=False,
+            )
 
     def forward(self, x: torch.Tensor):
         h = x + self.causal_multi_head_attn(self.rms_norm1(x))
@@ -385,7 +389,8 @@ class TransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float,
-        weights: dict[str, torch.Tensor],
+        weights: dict[str, torch.Tensor] = None,
+        device: torch.device = None,
     ):
         super().__init__()
 
@@ -397,28 +402,31 @@ class TransformerLM(nn.Module):
         self.d_ff = d_ff
         self.rope_theta = rope_theta
         self.weights = weights
+        self.device = device
 
         # Infer device from weights
-        device = list(weights.values())[0].device if weights else None
+        if self.device is None and weights:
+            self.device = list(weights.values())[0].device
 
         # 1. 初始化 Embedding 并加载权重
-        self.embedding = Embedding(self.vocab_size, self.d_model)
-        self.embedding.load_state_dict(
-            {"embedding_matrix": self.weights["token_embedings.weight"]}
-        )
+        self.embedding = Embedding(self.vocab_size, self.d_model, device=self.device)
+        if self.weights:
+            self.embedding.load_state_dict(
+                {"embedding_matrix": self.weights["token_embedings.weight"]}
+            )
 
         # 2. 初始化 Transformer 层列表
         self.layers = nn.ModuleList()
         for layer in range(self.num_layers):
-            w_q = self.weights[f"layers.{layer}.w_q"]
-            w_k = self.weights[f"layers.{layer}.w_k"]
-            w_v = self.weights[f"layers.{layer}.w_v"]
-            w_o = self.weights[f"layers.{layer}.w_o"]
-            w_ln1 = self.weights[f"layers.{layer}.w_ln1"]
-            w_ln2 = self.weights[f"layers.{layer}.w_ln2"]
-            w_ffn_w1 = self.weights[f"layers.{layer}.w_ffn_w1"]
-            w_ffn_w2 = self.weights[f"layers.{layer}.w_ffn_w2"]
-            w_ffn_w3 = self.weights[f"layers.{layer}.w_ffn_w3"]
+            w_q = self.weights[f"layers.{layer}.w_q"] if self.weights else None
+            w_k = self.weights[f"layers.{layer}.w_k"] if self.weights else None
+            w_v = self.weights[f"layers.{layer}.w_v"] if self.weights else None
+            w_o = self.weights[f"layers.{layer}.w_o"] if self.weights else None
+            w_ln1 = self.weights[f"layers.{layer}.w_ln1"] if self.weights else None
+            w_ln2 = self.weights[f"layers.{layer}.w_ln2"] if self.weights else None
+            w_ffn_w1 = self.weights[f"layers.{layer}.w_ffn_w1"] if self.weights else None
+            w_ffn_w2 = self.weights[f"layers.{layer}.w_ffn_w2"] if self.weights else None
+            w_ffn_w3 = self.weights[f"layers.{layer}.w_ffn_w3"] if self.weights else None
 
             block = TransformerBlock(
                 d_model=self.d_model,
@@ -426,6 +434,7 @@ class TransformerLM(nn.Module):
                 d_ff=self.d_ff,
                 max_seq_len=self.context_length,
                 theta=self.rope_theta,
+                device=self.device,
                 w_q=w_q,
                 w_k=w_k,
                 w_v=w_v,
@@ -435,17 +444,18 @@ class TransformerLM(nn.Module):
                 w_ffn_w1=w_ffn_w1,
                 w_ffn_w2=w_ffn_w2,
                 w_ffn_w3=w_ffn_w3,
-                device=device,
             )
             self.layers.append(block)
 
         # 3. 初始化 Final Norm
-        self.final_norm = RMSNorm(self.d_model, eps=1e-5)
-        self.final_norm.load_state_dict({"weight": self.weights["final_norm.weight"]})
+        self.final_norm = RMSNorm(self.d_model, eps=1e-5, device=self.device)
+        if self.weights:
+            self.final_norm.load_state_dict({"weight": self.weights["final_norm.weight"]})
 
         # 4. 初始化 Head (Linear)
-        self.head = Linear(self.d_model, self.vocab_size)
-        self.head.weight.data = self.weights["head.weight"]
+        self.head = Linear(self.d_model, self.vocab_size, device=self.device)
+        if self.weights:
+            self.head.weight.data = self.weights["head.weight"]
 
     def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
         x = self.embedding(in_indices)
@@ -643,7 +653,8 @@ def decode(
     top_p: float = 0.9,
 ) -> list:
     model.eval()
-    input_tensor = torch.tensor(input_tokens, dtype=torch.long).unsqueeze(0)
+    device = next(model.parameters()).device
+    input_tensor = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
     with torch.no_grad():
         current_sequence = input_tensor.clone()
         for _ in range(max_tokens_to_generate):
