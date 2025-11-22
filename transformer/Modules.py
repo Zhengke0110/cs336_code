@@ -608,3 +608,54 @@ def load_checkpoint(src: str, model: nn.Module, optimizer: torch.optim.Optimizer
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     return checkpoint["iteration"]
+
+
+def top_p_sampling(probabilities: torch.Tensor, top_p: float = 0.9) -> torch.Tensor:
+    sorted_probs, sorted_indices = torch.sort(probabilities, dim=-1, descending=True)
+
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    mask = cumulative_probs > top_p
+    mask[..., 1:] = mask[..., -1].clone()
+    mask[..., 0] = False
+
+    sorted_probs[mask] = 0.0
+
+    sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
+    next_token_idx = torch.multinomial(sorted_probs, 1)
+    next_token = torch.gather(sorted_indices, dim=-1, index=next_token_idx)
+
+    return next_token
+
+
+def temperature_scaling(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    scaled_logits = logits / temperature
+    probabilities = softmax(scaled_logits, dim=-1)
+    return probabilities
+
+
+def decode(
+    model: nn.Module,
+    input_tokens: list,
+    max_tokens_to_generate: int,
+    len_context: int,
+    temperature: float = 1.0,
+    top_p: float = 0.9,
+) -> list:
+    model.eval()
+    input_tensor = torch.tensor(input_tokens, dtype=torch.long).unsqueeze(0)
+    with torch.no_grad():
+        current_sequence = input_tensor.clone()
+        for _ in range(max_tokens_to_generate):
+            if current_sequence.size(1) > len_context:
+                model_input = current_sequence[:, -len_context]
+            else:
+                model_input = current_sequence
+            logits = model(model_input)
+
+            probs = temperature_scaling(
+                logits=logits[:, -1, :], temperature=temperature
+            )
+            next_token = top_p_sampling(probabilities=probs, top_p=top_p)
+            current_sequence = torch.cat([current_sequence, next_token], dim=-1)
+    return current_sequence.squeeze(0).tolist()
