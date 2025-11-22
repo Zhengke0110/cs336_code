@@ -1,7 +1,9 @@
+from typing import Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
 from math import sqrt
+from collections.abc import Callable, Iterable
 
 
 class Linear(nn.Module):
@@ -202,6 +204,20 @@ def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     return x_exp / x_exp.sum(dim=dim, keepdim=True)
 
 
+class CrossEntropyLoss:
+    def __init__(self, inputs: torch.Tensor, targets: torch.Tensor):
+        self.inputs = inputs
+        self.targets = targets
+        self.vocab_size = inputs.shape[1]
+        self.batch_size = inputs.shape[0]
+
+    def forward(self):
+        y_pred = softmax(self.inputs, dim=1)
+
+        p = y_pred[range(self.batch_size), self.targets]
+        return -torch.sum(torch.log(p))
+
+
 class ScaledDotProductAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -355,3 +371,166 @@ class TransformerBlock(nn.Module):
         # x = x + FFN(Norm2(x))
         out = h + self.swiglu(self.rms_norm2(h))
         return out
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+        weights: dict[str, torch.Tensor],
+    ):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.weights = weights
+
+        # Infer device from weights
+        device = list(weights.values())[0].device if weights else None
+
+        # 1. 初始化 Embedding 并加载权重
+        self.embedding = Embedding(self.vocab_size, self.d_model)
+        self.embedding.load_state_dict(
+            {"embedding_matrix": self.weights["token_embedings.weight"]}
+        )
+
+        # 2. 初始化 Transformer 层列表
+        self.layers = nn.ModuleList()
+        for layer in range(self.num_layers):
+            w_q = self.weights[f"layers.{layer}.w_q"]
+            w_k = self.weights[f"layers.{layer}.w_k"]
+            w_v = self.weights[f"layers.{layer}.w_v"]
+            w_o = self.weights[f"layers.{layer}.w_o"]
+            w_ln1 = self.weights[f"layers.{layer}.w_ln1"]
+            w_ln2 = self.weights[f"layers.{layer}.w_ln2"]
+            w_ffn_w1 = self.weights[f"layers.{layer}.w_ffn_w1"]
+            w_ffn_w2 = self.weights[f"layers.{layer}.w_ffn_w2"]
+            w_ffn_w3 = self.weights[f"layers.{layer}.w_ffn_w3"]
+
+            block = TransformerBlock(
+                d_model=self.d_model,
+                n_heads=self.num_heads,
+                d_ff=self.d_ff,
+                max_seq_len=self.context_length,
+                theta=self.rope_theta,
+                w_q=w_q,
+                w_k=w_k,
+                w_v=w_v,
+                w_o=w_o,
+                w_ln1=w_ln1,
+                w_ln2=w_ln2,
+                w_ffn_w1=w_ffn_w1,
+                w_ffn_w2=w_ffn_w2,
+                w_ffn_w3=w_ffn_w3,
+                device=device,
+            )
+            self.layers.append(block)
+
+        # 3. 初始化 Final Norm
+        self.final_norm = RMSNorm(self.d_model, eps=1e-5)
+        self.final_norm.load_state_dict({"weight": self.weights["final_norm.weight"]})
+
+        # 4. 初始化 Head (Linear)
+        self.head = Linear(self.d_model, self.vocab_size)
+        self.head.weight.data = self.weights["head.weight"]
+
+    def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(in_indices)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.final_norm(x)
+        logits = self.head(x)
+
+        return logits
+
+
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate:{lr}")
+
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                step = state.get("step", 0)
+                grad = p.grad.data
+                p.data -= lr / sqrt(step + 1) * grad
+
+                state["step"] = step + 1
+
+        return loss
+
+
+class Adamw(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+    ):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params=params, defaults=defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p.data)
+                    state["v"] = torch.zeros_like(p.data)
+
+                m: torch.Tensor = state["m"]
+                v: torch.Tensor = state["v"]
+                beta1, beta2 = group["betas"]
+
+                state["step"] += 1
+
+                # Ensure types for operations
+                beta1 = float(beta1)
+                beta2 = float(beta2)
+                lr = float(group["lr"])
+                weight_decay = float(group["weight_decay"])
+                eps = float(group["eps"])
+
+                m.mul_(beta1).add_(grad, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                bias_correction1 = 1 - beta1 ** state["step"]
+                bias_correction2 = 1 - beta2 ** state["step"]
+                step_size = lr / bias_correction1
+
+                denom = (v / bias_correction2).sqrt().add_(eps)
+                p.data.addcdiv_(m, denom, value=-step_size)
+
+                p.data.add_(p.data, alpha=-weight_decay * lr)
+        return loss
