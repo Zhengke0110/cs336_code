@@ -585,3 +585,26 @@ def get_batch(
         torch.tensor(inputs, dtype=torch.long, device=device),
         torch.tensor(targets, dtype=torch.long, device=device),
     )
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str,
+):
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "iteration": iteration,
+        },
+        out,
+    )
+
+
+def load_checkpoint(src: str, model: nn.Module, optimizer: torch.optim.Optimizer):
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["iteration"]
